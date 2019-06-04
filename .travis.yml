@@ -1,0 +1,27 @@
+language: cpp
+dist: xenial
+
+addons:
+  apt:
+    sources:
+      - sourceline: 'deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-8 main'
+        key_url: 'https://apt.llvm.org/llvm-snapshot.gpg.key'
+    update: true
+    packages: llvm-8-dev
+
+os:
+  - linux
+  - osx
+
+before_install:
+  - if [ $TRAVIS_OS_NAME = linux ]; then llvm_dir=/usr/lib/llvm-8; fi
+  - if [ $TRAVIS_OS_NAME = osx ]; then brew install llvm@8; fi
+  - if [ $TRAVIS_OS_NAME = osx ]; then llvm_dir=$(brew --prefix llvm@8); fi
+
+script:
+  - mkdir build
+  - cd build
+  - cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR=$llvm_dir/lib/cmake/llvm ..
+  - cmake --build .
+  - ./driver/fpscev_opt ../test/fpscev.ll -o - -S -fpscev-analysis
+
