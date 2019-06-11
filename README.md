@@ -21,8 +21,8 @@ if (i < 4) {
 }
 ```
 
-And lets say that via scalar evolution we know that `i` could _never_ be greater
-than 3. That allows the compiler to remove the entire if branch as it will never
+And lets say that via scalar evolution we know that `i` could _never_ be less
+than 4. That allows the compiler to remove the entire if branch as it will never
 be hit!
 
 ## Why Floating-Point Scalar Evolution?
@@ -38,7 +38,7 @@ A great use of this would be something like the following:
 float f = ...; // definitely not NaN or Infinity
 f = sin(f); // because f wasn't NaN or Infinity f is now in the range [-1..1]
 
-if (isfinite(f)) {
+if (!isfinite(f)) {
   // Do a million lines of awful code that will bloat you executable!
 }
 

@@ -35,7 +35,9 @@ using namespace llvm;
 
 namespace llvm {
 extern void initializeFPScalarEvolutionPassPass(PassRegistry&);
+extern void initializeFastMathPropagationPassPass(PassRegistry &);
 extern Pass* createFPScalarEvolutionPass();
+extern Pass *createFastMathPropagationPass();
 }
 
 static cl::opt<std::string> inputFilename(cl::Positional,
@@ -94,9 +96,10 @@ int main(const int argc, const char *const argv[]) {
   PassRegistry* const passRegistry = PassRegistry::getPassRegistry();
 
   initializeFPScalarEvolutionPassPass(*passRegistry);
+  initializeFastMathPropagationPassPass(*passRegistry);
 
   legacy::PassManager passManager;
-  passManager.add(createFPScalarEvolutionPass());
+  passManager.add(createFastMathPropagationPass());
   passManager.run(*module);
 
   std::error_code error;

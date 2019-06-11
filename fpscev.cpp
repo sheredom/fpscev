@@ -273,6 +273,14 @@ struct FPSCEV final {
     errs() << "isInteger: ";
     errs() << isInteger << "\n";
   }
+
+  bool isNaN() const { return min.isNaN() || max.isNaN(); }
+
+  bool isFinite() const { return min.isFinite() && max.isFinite(); }
+
+  bool isAllNegative() const { return max.isNegative(); }
+
+  bool isAllNonNegative() const { return !min.isNegative(); }
 };
 
 struct FPScalarEvolution final {
@@ -291,6 +299,16 @@ struct FPScalarEvolution final {
     }
 
     return &map[value];
+  }
+
+  const FPSCEV *getFPSCEV(Value *const value) const {
+    auto iterator = map.find(value);
+
+    if (iterator == map.end()) {
+      return nullptr;
+    }
+
+    return &iterator->second;
   }
 };
 
@@ -659,6 +677,10 @@ struct FPScalarEvolutionPass final : FunctionPass,
     // There is no remainder that takes a rounding mode, so we can't do anything
     // other than apply fast math flags.
     FPSCEV fpscev(inst.getType());
+
+    // Record the arguments to the frem even if we don't actually need them yet.
+    fpse.getFPSCEV(inst.getOperand(0));
+    fpse.getFPSCEV(inst.getOperand(1));
 
     const FastMathFlags flags = inst.getFastMathFlags();
     fpscev.min = applyFastMathFlags(fpscev.min, flags);
@@ -1348,6 +1370,8 @@ struct FPScalarEvolutionPass final : FunctionPass,
   // identify the pass.
   static char ID;
 
+  const FPScalarEvolution &getFPSCEV() const { return fpse; }
+
 private:
   FPScalarEvolution fpse;
   ScalarEvolution *scalarEvolution;
@@ -1356,10 +1380,139 @@ private:
 
 char FPScalarEvolutionPass::ID;
 
+namespace {
+struct FastMathPropagationPass final : public FunctionPass,
+                                       InstVisitor<FastMathPropagationPass> {
+  FastMathPropagationPass() : FunctionPass(ID) {}
+
+  bool runOnFunction(Function &function) override {
+    fpse = &getAnalysis<FPScalarEvolutionPass>().getFPSCEV();
+    modified = false;
+    visit(function);
+    return modified;
+  }
+
+  void visitFCmpInst(FCmpInst &inst) {
+    const FPSCEV *const xFpscev = fpse->getFPSCEV(inst.getOperand(0));
+    const FPSCEV *const yFpscev = fpse->getFPSCEV(inst.getOperand(1));
+
+    if (xFpscev->isFinite() && yFpscev->isFinite()) {
+      inst.setHasNoInfs(true);
+      modified = true;
+    }
+
+    if (!xFpscev->isNaN() && !yFpscev->isNaN()) {
+      inst.setHasNoNaNs(true);
+      modified = true;
+    }
+  }
+
+  void visitUnaryOperator(UnaryOperator &inst) {
+    switch (inst.getOpcode()) {
+    default:
+      return;
+    case Instruction::FNeg:
+      break;
+    }
+
+    const FPSCEV *const fpscev = fpse->getFPSCEV(inst.getOperand(0));
+
+    if (fpscev->isFinite()) {
+      inst.setHasNoInfs(true);
+      modified = true;
+    }
+
+    if (!fpscev->isNaN()) {
+      inst.setHasNoNaNs(true);
+      modified = true;
+    }
+  }
+
+  void visitBinaryOperator(BinaryOperator &inst) {
+    switch (inst.getOpcode()) {
+    default:
+      return;
+    case Instruction::FAdd:
+    case Instruction::FSub:
+    case Instruction::FMul:
+    case Instruction::FDiv:
+    case Instruction::FRem:
+      break;
+    }
+
+    const FPSCEV *const xFpscev = fpse->getFPSCEV(inst.getOperand(0));
+    const FPSCEV *const yFpscev = fpse->getFPSCEV(inst.getOperand(1));
+    const FPSCEV *const fpscev = fpse->getFPSCEV(&inst);
+
+    if (fpscev->isFinite() && xFpscev->isFinite() && yFpscev->isFinite()) {
+      inst.setHasNoInfs(true);
+      modified = true;
+    }
+
+    if (!fpscev->isNaN() && !xFpscev->isNaN() && !yFpscev->isNaN()) {
+      inst.setHasNoNaNs(true);
+      modified = true;
+    }
+  }
+
+  void visitIntrinsicInst(IntrinsicInst &inst) {
+    bool atLeastOneFP = false;
+    bool allFinite = true;
+    bool allNotNaN = true;
+
+    for (Value *const arg : inst.args()) {
+      const FPSCEV *const fpscev = fpse->getFPSCEV(arg);
+
+      if (fpscev) {
+        atLeastOneFP = true;
+        allFinite = allFinite && fpscev->isFinite();
+        allNotNaN = allNotNaN && !fpscev->isNaN();
+      }
+    }
+
+    const FPSCEV *const fpscev = fpse->getFPSCEV(&inst);
+
+    if (fpscev) {
+      atLeastOneFP = true;
+      allFinite = allFinite && fpscev->isFinite();
+      allNotNaN = allNotNaN && !fpscev->isNaN();
+    }
+
+    if (atLeastOneFP) {
+      if (allFinite) {
+        inst.setHasNoInfs(true);
+        modified = true;
+      }
+
+      if (allNotNaN) {
+        inst.setHasNoNaNs(true);
+        modified = true;
+      }
+    }
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<FPScalarEvolutionPass>();
+  }
+
+  // The ID of this pass - the address of which is used by LLVM to uniquely
+  // identify the pass.
+  static char ID;
+
+private:
+  const FPScalarEvolution *fpse;
+  bool modified;
+};
+} // namespace
+
+char FastMathPropagationPass::ID;
+
 namespace llvm {
 void initializeFPScalarEvolutionPassPass(PassRegistry &);
+void initializeFastMathPropagationPassPass(PassRegistry &);
 
 Pass *createFPScalarEvolutionPass() { return new FPScalarEvolutionPass(); }
+Pass *createFastMathPropagationPass() { return new FastMathPropagationPass(); }
 } // namespace llvm
 
 INITIALIZE_PASS_BEGIN(FPScalarEvolutionPass, "fp-scalar-evolution",
@@ -1367,3 +1520,9 @@ INITIALIZE_PASS_BEGIN(FPScalarEvolutionPass, "fp-scalar-evolution",
 INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass);
 INITIALIZE_PASS_END(FPScalarEvolutionPass, "fp-scalar-evolution",
                     "Floating Point Scalar Evolution Analysis", false, true);
+
+INITIALIZE_PASS_BEGIN(FastMathPropagationPass, "fast-math-propagation",
+                      "Fast Math Propagation", false, false);
+INITIALIZE_PASS_DEPENDENCY(FPScalarEvolutionPass);
+INITIALIZE_PASS_END(FastMathPropagationPass, "fast-math-propagation",
+                    "Fast Math Propagation", false, false);
