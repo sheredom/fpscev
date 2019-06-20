@@ -25,4 +25,4 @@ script:
   - cmake --build .
   - ./driver/fpscev_opt ../test/fpscev.ll -o - -S -fpscev-analysis
   - ./driver/fpscev_opt ../test/fast_math_propagation.ll -o - -S
-
+  - ./driver/fpscev_opt ../test/fp_inst_simplify.ll -o - -S

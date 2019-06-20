@@ -25,6 +25,7 @@
 
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/ValueMap.h"
 
@@ -281,14 +282,81 @@ struct FPSCEV final {
   bool isAllNegative() const { return max.isNegative(); }
 
   bool isAllNonNegative() const { return !min.isNegative(); }
+
+  bool hasOverlappingRange(const FPSCEV &fpscev) const {
+    return isInRange(fpscev.min, min, max) || isInRange(fpscev.max, min, max) ||
+           isInRange(min, fpscev.min, fpscev.max) ||
+           isInRange(max, fpscev.min, fpscev.max);
+  }
+
+  bool isLessThan(const FPSCEV &fpscev) const {
+    switch (max.compare(fpscev.min)) {
+    case APFloat::cmpLessThan:
+      return true;
+    case APFloat::cmpEqual:
+    case APFloat::cmpGreaterThan:
+    case APFloat::cmpUnordered:
+      return false;
+    }
+  }
+
+  bool isLessThanEqual(const APFloat &apfloat) const {
+    switch (max.compare(apfloat)) {
+    case APFloat::cmpLessThan:
+    case APFloat::cmpEqual:
+      return true;
+    case APFloat::cmpGreaterThan:
+    case APFloat::cmpUnordered:
+      return false;
+    }
+  }
+
+  bool isLessThanEqual(const FPSCEV &fpscev) const {
+    return isLessThanEqual(fpscev.min);
+  }
+
+  bool isGreaterThan(const FPSCEV &fpscev) const {
+    switch (min.compare(fpscev.max)) {
+    case APFloat::cmpGreaterThan:
+      return true;
+    case APFloat::cmpLessThan:
+    case APFloat::cmpEqual:
+    case APFloat::cmpUnordered:
+      return false;
+    }
+  }
+
+  bool isGreaterThanEqual(const APFloat &apfloat) const {
+    switch (min.compare(apfloat)) {
+    case APFloat::cmpGreaterThan:
+    case APFloat::cmpEqual:
+      return true;
+    case APFloat::cmpLessThan:
+    case APFloat::cmpUnordered:
+      return false;
+    }
+  }
+
+  bool isGreaterThanEqual(const FPSCEV &fpscev) const {
+    return isGreaterThanEqual(fpscev.max);
+  }
+
+  bool isSingleElement() const { return min.bitwiseIsEqual(max); }
+
+  FPSCEV cloneWithFastMathFlags(FastMathFlags fmf) const {
+    FPSCEV fpscev(*this);
+    fpscev.min = applyFastMathFlags(fpscev.min, fmf);
+    fpscev.max = applyFastMathFlags(fpscev.max, fmf);
+    return fpscev;
+  }
 };
 
 struct FPScalarEvolution final {
-  ValueMap<Value *, FPSCEV> map;
+  ValueMap<const Value *, FPSCEV> map;
 
-  FPSCEV *getFPSCEV(Value *const value) {
+  FPSCEV *getFPSCEV(const Value *const value) {
     if (map.count(value) == 0) {
-      if (ConstantFP *const constant = dyn_cast<ConstantFP>(value)) {
+      if (const ConstantFP *const constant = dyn_cast<ConstantFP>(value)) {
         const APFloat &apfloat = constant->getValueAPF();
         map[value] = FPSCEV(apfloat, apfloat, apfloat.isInteger());
       } else if (value->getType()->isFloatingPointTy()) {
@@ -301,7 +369,7 @@ struct FPScalarEvolution final {
     return &map[value];
   }
 
-  const FPSCEV *getFPSCEV(Value *const value) const {
+  const FPSCEV *getFPSCEV(const Value *const value) const {
     auto iterator = map.find(value);
 
     if (iterator == map.end()) {
@@ -310,6 +378,16 @@ struct FPScalarEvolution final {
 
     return &iterator->second;
   }
+
+  void copyFPSCEVFromValue(const Value *const dst, const Value *const src) {
+    auto iterator = map.find(src);
+
+    if (iterator != map.end()) {
+      map[dst] = iterator->second;
+    }
+  }
+
+  void forgetValue(const Value *const value) { map.erase(value); }
 };
 
 // Define our LLVM pass as inheriting from a FunctionPass.
@@ -341,7 +419,7 @@ struct FPScalarEvolutionPass final : FunctionPass,
     }
 
     for (auto fpscev : fpse.map) {
-      Value &inst = *fpscev.first;
+      const Value &inst = *fpscev.first;
       ANALYSIS(inst.print(errs()));
       ANALYSIS(errs() << "\n");
       ANALYSIS(if (auto fpscev = fpse.getFPSCEV(&inst)) fpscev->dump());
@@ -1370,6 +1448,7 @@ struct FPScalarEvolutionPass final : FunctionPass,
   // identify the pass.
   static char ID;
 
+  FPScalarEvolution &getFPSCEV() { return fpse; }
   const FPScalarEvolution &getFPSCEV() const { return fpse; }
 
 private:
@@ -1395,6 +1474,10 @@ struct FastMathPropagationPass final : public FunctionPass,
   void visitFCmpInst(FCmpInst &inst) {
     const FPSCEV *const xFpscev = fpse->getFPSCEV(inst.getOperand(0));
     const FPSCEV *const yFpscev = fpse->getFPSCEV(inst.getOperand(1));
+
+    if (!xFpscev || !yFpscev) {
+      return;
+    }
 
     if (xFpscev->isFinite() && yFpscev->isFinite()) {
       inst.setHasNoInfs(true);
@@ -1461,18 +1544,18 @@ struct FastMathPropagationPass final : public FunctionPass,
     bool allNotNaN = true;
 
     for (Value *const arg : inst.args()) {
-      const FPSCEV *const fpscev = fpse->getFPSCEV(arg);
+      if (arg->getType()->isFloatingPointTy()) {
+        const FPSCEV *const fpscev = fpse->getFPSCEV(arg);
 
-      if (fpscev) {
         atLeastOneFP = true;
         allFinite = allFinite && fpscev->isFinite();
         allNotNaN = allNotNaN && !fpscev->isNaN();
       }
     }
 
-    const FPSCEV *const fpscev = fpse->getFPSCEV(&inst);
+    if (inst.getType()->isFloatingPointTy()) {
+      const FPSCEV *const fpscev = fpse->getFPSCEV(&inst);
 
-    if (fpscev) {
       atLeastOneFP = true;
       allFinite = allFinite && fpscev->isFinite();
       allNotNaN = allNotNaN && !fpscev->isNaN();
@@ -1493,6 +1576,7 @@ struct FastMathPropagationPass final : public FunctionPass,
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<FPScalarEvolutionPass>();
+    AU.addPreserved<FPScalarEvolutionPass>();
   }
 
   // The ID of this pass - the address of which is used by LLVM to uniquely
@@ -1500,19 +1584,476 @@ struct FastMathPropagationPass final : public FunctionPass,
   static char ID;
 
 private:
-  const FPScalarEvolution *fpse;
+  FPScalarEvolution *fpse;
   bool modified;
 };
 } // namespace
 
 char FastMathPropagationPass::ID;
 
+namespace {
+struct FPInstSimplifyPass final : public FunctionPass,
+                                  InstVisitor<FPInstSimplifyPass> {
+  FPInstSimplifyPass() : FunctionPass(ID) {}
+
+  bool runOnFunction(Function &function) override {
+    fpse = &getAnalysis<FPScalarEvolutionPass>().getFPSCEV();
+    modified = false;
+    visit(function);
+
+    for (Instruction *const inst : toRemoves) {
+      fpse->forgetValue(inst);
+      inst->eraseFromParent();
+    }
+
+    modified |= !toRemoves.empty();
+
+    toRemoves.clear();
+    return modified;
+  }
+
+  void visitFCmpInst(FCmpInst &inst) {
+    FastMathFlags fmf = inst.getFastMathFlags();
+    const FPSCEV xFpscev =
+        fpse->getFPSCEV(inst.getOperand(0))->cloneWithFastMathFlags(fmf);
+    const FPSCEV yFpscev =
+        fpse->getFPSCEV(inst.getOperand(1))->cloneWithFastMathFlags(fmf);
+
+    CmpInst::Predicate predicate = CmpInst::BAD_FCMP_PREDICATE;
+
+    switch (inst.getPredicate()) {
+    default:
+      return;
+    case CmpInst::FCMP_OEQ:
+      if (!xFpscev.isNaN() && !yFpscev.isNaN()) {
+        if (!xFpscev.hasOverlappingRange(yFpscev)) {
+          predicate = CmpInst::FCMP_FALSE;
+        }
+      }
+      break;
+    case CmpInst::FCMP_OGT:
+      if (!xFpscev.isNaN() && !yFpscev.isNaN()) {
+        if (xFpscev.isGreaterThan(yFpscev)) {
+          predicate = CmpInst::FCMP_TRUE;
+        } else if (xFpscev.isLessThanEqual(yFpscev)) {
+          predicate = CmpInst::FCMP_FALSE;
+        }
+      }
+      break;
+    case CmpInst::FCMP_OGE:
+      if (!xFpscev.isNaN() && !yFpscev.isNaN()) {
+        if (xFpscev.isGreaterThanEqual(yFpscev)) {
+          predicate = CmpInst::FCMP_TRUE;
+        } else if (xFpscev.isLessThan(yFpscev)) {
+          predicate = CmpInst::FCMP_FALSE;
+        }
+      }
+      break;
+    case CmpInst::FCMP_OLT:
+      if (!xFpscev.isNaN() && !yFpscev.isNaN()) {
+        if (xFpscev.isLessThan(yFpscev)) {
+          predicate = CmpInst::FCMP_TRUE;
+        } else if (xFpscev.isGreaterThanEqual(yFpscev)) {
+          predicate = CmpInst::FCMP_FALSE;
+        }
+      }
+      break;
+    case CmpInst::FCMP_OLE:
+      if (!xFpscev.isNaN() && !yFpscev.isNaN()) {
+        if (xFpscev.isLessThanEqual(yFpscev)) {
+          predicate = CmpInst::FCMP_TRUE;
+        } else if (xFpscev.isGreaterThan(yFpscev)) {
+          predicate = CmpInst::FCMP_FALSE;
+        }
+      }
+      break;
+    case CmpInst::FCMP_ONE:
+      if (!xFpscev.isNaN() && !yFpscev.isNaN()) {
+        if (!xFpscev.hasOverlappingRange(yFpscev)) {
+          predicate = CmpInst::FCMP_TRUE;
+        }
+      }
+      break;
+    case CmpInst::FCMP_ORD:
+      if (!xFpscev.isNaN() && !yFpscev.isNaN()) {
+        predicate = CmpInst::FCMP_TRUE;
+      }
+      break;
+    case CmpInst::FCMP_UNO:
+      if (!xFpscev.isNaN() && !yFpscev.isNaN()) {
+        predicate = CmpInst::FCMP_FALSE;
+      }
+      break;
+    case CmpInst::FCMP_UEQ:
+      if (!xFpscev.hasOverlappingRange(yFpscev)) {
+        predicate = CmpInst::FCMP_FALSE;
+      }
+      break;
+    case CmpInst::FCMP_UGT:
+      if (xFpscev.isGreaterThan(yFpscev)) {
+        predicate = CmpInst::FCMP_TRUE;
+      } else if (xFpscev.isLessThanEqual(yFpscev)) {
+        predicate = CmpInst::FCMP_FALSE;
+      }
+      break;
+    case CmpInst::FCMP_UGE:
+      if (xFpscev.isGreaterThanEqual(yFpscev)) {
+        predicate = CmpInst::FCMP_TRUE;
+      } else if (xFpscev.isLessThan(yFpscev)) {
+        predicate = CmpInst::FCMP_FALSE;
+      }
+      break;
+    case CmpInst::FCMP_ULT:
+      if (xFpscev.isLessThan(yFpscev)) {
+        predicate = CmpInst::FCMP_TRUE;
+      } else if (xFpscev.isGreaterThanEqual(yFpscev)) {
+        predicate = CmpInst::FCMP_FALSE;
+      }
+      break;
+    case CmpInst::FCMP_ULE:
+      if (xFpscev.isLessThanEqual(yFpscev)) {
+        predicate = CmpInst::FCMP_TRUE;
+      } else if (xFpscev.isGreaterThan(yFpscev)) {
+        predicate = CmpInst::FCMP_FALSE;
+      }
+      break;
+    case CmpInst::FCMP_UNE:
+      if (!xFpscev.hasOverlappingRange(yFpscev)) {
+        predicate = CmpInst::FCMP_TRUE;
+      }
+      break;
+    }
+
+    if (predicate != CmpInst::BAD_FCMP_PREDICATE) {
+      inst.setPredicate(predicate);
+      modified = true;
+    }
+  }
+
+  template <Intrinsic::ID> void visitIntrinsic(IntrinsicInst &inst);
+
+  void visitIntrinsicInst(IntrinsicInst &inst);
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<FPScalarEvolutionPass>();
+    AU.addPreserved<FPScalarEvolutionPass>();
+  }
+
+  // The ID of this pass - the address of which is used by LLVM to uniquely
+  // identify the pass.
+  static char ID;
+
+private:
+  FPScalarEvolution *fpse;
+  bool modified;
+  SmallVector<Instruction *, 8> toRemoves;
+};
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::sqrt>(IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+
+  // If the input is all negative, the result is NaN.
+  if (xFpscev.isAllNegative()) {
+    // If the instruction cannot return NaNs, replace it with undef.
+    if (inst.hasNoNaNs()) {
+      inst.replaceAllUsesWith(UndefValue::get(inst.getType()));
+    } else {
+      inst.replaceAllUsesWith(ConstantFP::getNaN(inst.getType()));
+    }
+
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::pow>(IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  Value *const y = inst.getOperand(1);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+  const FPSCEV yFpscev = fpse->getFPSCEV(y)->cloneWithFastMathFlags(fmf);
+
+  // If y is an integer
+  if (yFpscev.isInteger) {
+    const fltSemantics &semantics = xFpscev.min.getSemantics();
+
+    // 2^24 is the last integer number that we can fully represent in both
+    // floating-point and i32.
+    const APInt minInt(32, -(1 << 24), true);
+    const APInt maxInt(32, 1 << 24, true);
+
+    // If y is between min/max int, we can use powi instead of pow!
+    if (yFpscev.isGreaterThanEqual(getFromInt(semantics, minInt, true)) &&
+        yFpscev.isLessThanEqual(getFromInt(semantics, maxInt, true))) {
+      IRBuilder<> irb(&inst);
+      StringRef yName(y->getName());
+      Twine name(yName, ".i32cast");
+      Value *const yCast = irb.CreateFPToSI(y, irb.getInt32Ty(), name);
+
+      Instruction *const powi = irb.CreateIntrinsic(
+          Intrinsic::powi, inst.getType(), {x, yCast}, &inst);
+      powi->takeName(&inst);
+
+      // Copy the fpscev information from the original instruction onto the new.
+      fpse->copyFPSCEVFromValue(powi, &inst);
+
+      inst.replaceAllUsesWith(powi);
+
+      toRemoves.push_back(&inst);
+    }
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::fabs>(IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+
+  // If the input is all not negative, we can just use the input.
+  if (xFpscev.isAllNonNegative()) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::minnum>(
+    IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  Value *const y = inst.getOperand(1);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+  const FPSCEV yFpscev = fpse->getFPSCEV(y)->cloneWithFastMathFlags(fmf);
+
+  // If one of the inputs is always less than the other, we fold away the
+  // intrinsic.
+  if (xFpscev.isLessThanEqual(yFpscev)) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  } else if (yFpscev.isLessThanEqual(xFpscev)) {
+    inst.replaceAllUsesWith(y);
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::maxnum>(
+    IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  Value *const y = inst.getOperand(1);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+  const FPSCEV yFpscev = fpse->getFPSCEV(y)->cloneWithFastMathFlags(fmf);
+
+  // If one of the inputs is always less than the other, we fold away the
+  // intrinsic.
+  if (xFpscev.isGreaterThanEqual(yFpscev)) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  } else if (yFpscev.isGreaterThanEqual(xFpscev)) {
+    inst.replaceAllUsesWith(y);
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::minimum>(
+    IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  Value *const y = inst.getOperand(1);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+  const FPSCEV yFpscev = fpse->getFPSCEV(y)->cloneWithFastMathFlags(fmf);
+
+  // If one of the inputs is always less than the other, we fold away the
+  // intrinsic.
+  if (xFpscev.isLessThanEqual(yFpscev)) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  } else if (yFpscev.isLessThanEqual(xFpscev)) {
+    inst.replaceAllUsesWith(y);
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::maximum>(
+    IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  Value *const y = inst.getOperand(1);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+  const FPSCEV yFpscev = fpse->getFPSCEV(y)->cloneWithFastMathFlags(fmf);
+
+  // If one of the inputs is always less than the other, we fold away the
+  // intrinsic.
+  if (xFpscev.isGreaterThanEqual(yFpscev)) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  } else if (yFpscev.isGreaterThanEqual(xFpscev)) {
+    inst.replaceAllUsesWith(y);
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::copysign>(
+    IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  Value *const y = inst.getOperand(1);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+  const FPSCEV yFpscev = fpse->getFPSCEV(y)->cloneWithFastMathFlags(fmf);
+
+  if ((xFpscev.isAllNonNegative() && yFpscev.isAllNonNegative()) ||
+      (xFpscev.isAllNegative() && yFpscev.isAllNegative())) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  } else if ((xFpscev.isAllNonNegative() && yFpscev.isAllNegative()) ||
+             (xFpscev.isAllNegative() && yFpscev.isAllNonNegative())) {
+    IRBuilder<> irb(&inst);
+    Value *const value = irb.CreateFNeg(x);
+    value->takeName(&inst);
+
+    // Copy the fpscev information from the original instruction onto the new.
+    fpse->copyFPSCEVFromValue(value, &inst);
+
+    if (Instruction *const otherInst = dyn_cast<Instruction>(value)) {
+      otherInst->setFastMathFlags(inst.getFastMathFlags());
+    }
+
+    inst.replaceAllUsesWith(value);
+    toRemoves.push_back(&inst);
+  } else if (yFpscev.isAllNonNegative()) {
+    IRBuilder<> irb(&inst);
+    Instruction *const fabs =
+        irb.CreateUnaryIntrinsic(Intrinsic::fabs, x, &inst);
+    fabs->takeName(&inst);
+    // Copy the fpscev information from the original instruction onto the new.
+    fpse->copyFPSCEVFromValue(fabs, &inst);
+    inst.replaceAllUsesWith(fabs);
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::floor>(IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+
+  // If the input is already an integer, floor is a no-op.
+  if (xFpscev.isInteger) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::ceil>(IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+
+  // If the input is already an integer, floor is a no-op.
+  if (xFpscev.isInteger) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::trunc>(IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+
+  // If the input is already an integer, floor is a no-op.
+  if (xFpscev.isInteger) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::rint>(IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+
+  // If the input is already an integer, floor is a no-op.
+  if (xFpscev.isInteger) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::nearbyint>(
+    IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+
+  // If the input is already an integer, floor is a no-op.
+  if (xFpscev.isInteger) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  }
+}
+
+template <>
+void FPInstSimplifyPass::visitIntrinsic<Intrinsic::round>(IntrinsicInst &inst) {
+  FastMathFlags fmf = inst.getFastMathFlags();
+  Value *const x = inst.getOperand(0);
+  const FPSCEV xFpscev = fpse->getFPSCEV(x)->cloneWithFastMathFlags(fmf);
+
+  // If the input is already an integer, floor is a no-op.
+  if (xFpscev.isInteger) {
+    inst.replaceAllUsesWith(x);
+    toRemoves.push_back(&inst);
+  }
+}
+
+void FPInstSimplifyPass::visitIntrinsicInst(IntrinsicInst &inst) {
+  switch (inst.getIntrinsicID()) {
+  default:
+    return;
+#define INTRINSIC_VISIT(x)                                                     \
+  case x:                                                                      \
+    return visitIntrinsic<x>(inst)
+    INTRINSIC_VISIT(Intrinsic::sqrt);
+    INTRINSIC_VISIT(Intrinsic::pow);
+    INTRINSIC_VISIT(Intrinsic::fabs);
+    INTRINSIC_VISIT(Intrinsic::minnum);
+    INTRINSIC_VISIT(Intrinsic::maxnum);
+    INTRINSIC_VISIT(Intrinsic::minimum);
+    INTRINSIC_VISIT(Intrinsic::maximum);
+    INTRINSIC_VISIT(Intrinsic::copysign);
+    INTRINSIC_VISIT(Intrinsic::floor);
+    INTRINSIC_VISIT(Intrinsic::ceil);
+    INTRINSIC_VISIT(Intrinsic::trunc);
+    INTRINSIC_VISIT(Intrinsic::rint);
+    INTRINSIC_VISIT(Intrinsic::nearbyint);
+    INTRINSIC_VISIT(Intrinsic::round);
+#undef INTRINSIC_VISIT
+  }
+}
+} // namespace
+
+char FPInstSimplifyPass::ID;
+
 namespace llvm {
 void initializeFPScalarEvolutionPassPass(PassRegistry &);
 void initializeFastMathPropagationPassPass(PassRegistry &);
+void initializeFPInstSimplifyPassPass(PassRegistry &);
 
-Pass *createFPScalarEvolutionPass() { return new FPScalarEvolutionPass(); }
 Pass *createFastMathPropagationPass() { return new FastMathPropagationPass(); }
+Pass *createFPInstSimplifyPass() { return new FPInstSimplifyPass(); }
 } // namespace llvm
 
 INITIALIZE_PASS_BEGIN(FPScalarEvolutionPass, "fp-scalar-evolution",
@@ -1526,3 +2067,10 @@ INITIALIZE_PASS_BEGIN(FastMathPropagationPass, "fast-math-propagation",
 INITIALIZE_PASS_DEPENDENCY(FPScalarEvolutionPass);
 INITIALIZE_PASS_END(FastMathPropagationPass, "fast-math-propagation",
                     "Fast Math Propagation", false, false);
+
+INITIALIZE_PASS_BEGIN(FPInstSimplifyPass, "fp-inst-simplify",
+                      "Floating Point Instruction Simplification", false,
+                      false);
+INITIALIZE_PASS_DEPENDENCY(FPScalarEvolutionPass);
+INITIALIZE_PASS_END(FPInstSimplifyPass, "fp-inst-simplify",
+                    "Floating Point Instruction Simplification", false, false);

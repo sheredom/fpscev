@@ -34,11 +34,12 @@
 using namespace llvm;
 
 namespace llvm {
-extern void initializeFPScalarEvolutionPassPass(PassRegistry&);
+extern void initializeFPScalarEvolutionPassPass(PassRegistry &);
 extern void initializeFastMathPropagationPassPass(PassRegistry &);
-extern Pass* createFPScalarEvolutionPass();
+extern void initializeFPInstSimplifyPassPass(PassRegistry &);
 extern Pass *createFastMathPropagationPass();
-}
+extern Pass *createFPInstSimplifyPass();
+} // namespace llvm
 
 static cl::opt<std::string> inputFilename(cl::Positional,
                                           cl::desc("<input bitcode file>"),
@@ -93,13 +94,15 @@ int main(const int argc, const char *const argv[]) {
     }
   }
 
-  PassRegistry* const passRegistry = PassRegistry::getPassRegistry();
+  PassRegistry *const passRegistry = PassRegistry::getPassRegistry();
 
   initializeFPScalarEvolutionPassPass(*passRegistry);
   initializeFastMathPropagationPassPass(*passRegistry);
+  initializeFPInstSimplifyPassPass(*passRegistry);
 
   legacy::PassManager passManager;
   passManager.add(createFastMathPropagationPass());
+  passManager.add(createFPInstSimplifyPass());
   passManager.run(*module);
 
   std::error_code error;
