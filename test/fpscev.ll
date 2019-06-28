@@ -208,6 +208,14 @@ define float @sqrt_input_0_to_1(i8 %i) {
   ret float %f3
 }
 
+define float @pow(i3 %i, i4 %i2) {
+  %f = uitofp i3 %i to float
+  %f2 = uitofp i4 %i2 to float
+  %f3 = fadd float %f, 1.0
+  %f4 = call float @llvm.pow.f32(float %f3, float %f2)
+  ret float %f4
+}
+
 define float @powi(i16 %i, i8 %i2) {
   %f = uitofp i16 %i to float
   %i3 = zext i8 %i2 to i32
@@ -247,13 +255,15 @@ define float @sin_nnan_ninf(float %f) {
   ret float %f2
 }
 
-define float @exp(float %f) {
+define float @exp(i5 %i) {
+  %f = sitofp i5 %i to float
   %f2 = call float @llvm.exp.f32(float %f)
   ret float %f2
 }
 
-define float @exp2(float %f) {
-  %f2 = call float @llvm.exp.f32(float %f)
+define float @exp2(i5 %i) {
+  %f = sitofp i5 %i to float
+  %f2 = call float @llvm.exp2.f32(float %f)
   ret float %f2
 }
 
@@ -462,6 +472,7 @@ define float @round(i32 %i) {
 
 declare float @some_called_func()
 declare float @llvm.sqrt.f32(float %f)
+declare float @llvm.pow.f32(float %f, float %f2)
 declare float @llvm.powi.f32(float %f, i32 %i)
 declare float @llvm.cos.f32(float %f)
 declare float @llvm.sin.f32(float %f)

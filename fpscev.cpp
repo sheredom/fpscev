@@ -23,6 +23,7 @@
 //
 // For more information, please refer to <http://unlicense.org/>
 
+#include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/IRBuilder.h"
@@ -289,8 +290,8 @@ struct FPSCEV final {
            isInRange(max, fpscev.min, fpscev.max);
   }
 
-  bool isLessThan(const FPSCEV &fpscev) const {
-    switch (max.compare(fpscev.min)) {
+  bool isLessThan(const APFloat &apfloat) const {
+    switch (max.compare(apfloat)) {
     case APFloat::cmpLessThan:
       return true;
     case APFloat::cmpEqual:
@@ -299,6 +300,8 @@ struct FPSCEV final {
       return false;
     }
   }
+
+  bool isLessThan(const FPSCEV &fpscev) const { return isLessThan(fpscev.min); }
 
   bool isLessThanEqual(const APFloat &apfloat) const {
     switch (max.compare(apfloat)) {
@@ -315,8 +318,8 @@ struct FPSCEV final {
     return isLessThanEqual(fpscev.min);
   }
 
-  bool isGreaterThan(const FPSCEV &fpscev) const {
-    switch (min.compare(fpscev.max)) {
+  bool isGreaterThan(const APFloat &apfloat) const {
+    switch (min.compare(apfloat)) {
     case APFloat::cmpGreaterThan:
       return true;
     case APFloat::cmpLessThan:
@@ -324,6 +327,10 @@ struct FPSCEV final {
     case APFloat::cmpUnordered:
       return false;
     }
+  }
+
+  bool isGreaterThan(const FPSCEV &fpscev) const {
+    return isGreaterThan(fpscev.max);
   }
 
   bool isGreaterThanEqual(const APFloat &apfloat) const {
@@ -349,6 +356,8 @@ struct FPSCEV final {
     fpscev.max = applyFastMathFlags(fpscev.max, fmf);
     return fpscev;
   }
+
+  const fltSemantics &getSemantics() const { return min.getSemantics(); }
 };
 
 struct FPScalarEvolution final {
@@ -804,634 +813,9 @@ struct FPScalarEvolutionPass final : FunctionPass,
     fpse.map[&inst] = fpscev;
   }
 
-  void visitSqrt(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
+  template <Intrinsic::ID> void visitIntrinsic(IntrinsicInst &inst);
 
-    const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
-
-    APFloat min = applyFastMathFlags(fpscev->min, flags);
-    APFloat max = applyFastMathFlags(fpscev->max, flags);
-
-    const fltSemantics &semantics = min.getSemantics();
-
-    const APFloat nan = APFloat::getNaN(semantics, false);
-    const APFloat zero = APFloat::getZero(semantics, false);
-
-    // If the upper bound of the range is negative, all inputs are negative and
-    // we always produce a NaN.
-    if (max.isNegative()) {
-      min = nan;
-    }
-
-    // If min is negative or max is potentially a NaN, the output max is at most
-    // a NaN.
-    if (min.isNegative() || max.isNaN()) {
-      max = nan;
-    }
-
-    min = zero;
-    max = applyFastMathFlags(fpscev->max, flags);
-
-    // The sqrt of something is at most (input is NaN or infinity) as big as the
-    // maximum input value, and as small as zero.
-    fpse.map[&inst] = FPSCEV(zero, max, false);
-  }
-
-  void visitPowi(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
-    ConstantRange range = scalarEvolution->getSignedRange(
-        scalarEvolution->getSCEV(inst.getOperand(1)));
-
-    APFloat min = applyFastMathFlags(fpscev->min, flags);
-    APFloat max = applyFastMathFlags(fpscev->max, flags);
-
-    const fltSemantics &semantics = min.getSemantics();
-
-    const APFloat zero = APFloat::getZero(semantics, false);
-    const APFloat one = getOne(semantics);
-
-    // If the value to raise to a power is positive.
-    if (!min.isNegative()) {
-      const bool isOneOrLess =
-          isInRange(min, zero, one) && isInRange(max, zero, one);
-
-      // If the integer power is a negative and the float is greater than one,
-      // the result will always be at least as small as the inputs.
-      if (isAllNegative(range) && !isOneOrLess) {
-        fpse.map[&inst] = FPSCEV(zero, max, false);
-        return;
-      }
-
-      // If the integer power is definitely not a negative, the result will be
-      // in the range [min(1, min)..infinity] if x is greater than 1. Otherwise
-      // the output will be between 0 and 1.
-      if (isAllNonNegative(range)) {
-        // Because x^0 == 1, the output could always be 1 or lower.
-        min = isOneOrLess ? zero : getMinimum({min, one});
-
-        // If the input x is one or greater then the output could be as
-        max = isOneOrLess ? one : APFloat::getInf(semantics, false);
-
-        max = applyFastMathFlags(max, flags);
-
-        fpse.map[&inst] = FPSCEV(min, max, false);
-        return;
-      }
-    }
-
-    FPSCEV newFpscev(inst.getType());
-
-    newFpscev.min = applyFastMathFlags(newFpscev.min, flags);
-    newFpscev.max = applyFastMathFlags(newFpscev.max, flags);
-
-    fpse.map[&inst] = newFpscev;
-  }
-
-  void visitTrig(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
-    APFloat min = applyFastMathFlags(fpscev->min, flags);
-    APFloat max = applyFastMathFlags(fpscev->max, flags);
-
-    // If the range is finite (not inf or nan) the output is always [-1..1].
-    if (min.isFinite() && max.isFinite()) {
-      const APFloat one = getOne(min.getSemantics());
-      APFloat minusOne = one;
-      minusOne.changeSign();
-
-      fpse.map[&inst] = FPSCEV(minusOne, one, false);
-      return;
-    }
-
-    FPSCEV newFpscev(inst.getType());
-
-    newFpscev.min = applyFastMathFlags(newFpscev.min, flags);
-    newFpscev.max = applyFastMathFlags(newFpscev.max, flags);
-
-    fpse.map[&inst] = newFpscev;
-  }
-
-  void visitExp(IntrinsicInst &inst) {
-    FPSCEV fpscev(inst.getType());
-
-    // Exp always has a positive result.
-    const APFloat zero = APFloat::getZero(fpscev.min.getSemantics(), false);
-    fpscev.min = zero;
-
-    const FastMathFlags flags = inst.getFastMathFlags();
-    fpscev.max = applyFastMathFlags(fpscev.max, flags);
-
-    fpse.map[&inst] = fpscev;
-  }
-
-  void visitLog(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
-    APFloat min = applyFastMathFlags(fpscev->min, flags);
-    APFloat max = applyFastMathFlags(fpscev->max, flags);
-
-    const fltSemantics &semantics = min.getSemantics();
-
-    // If the full range is negative, always returns a NaN.
-    if (max.isNegative()) {
-      APFloat nan = APFloat::getNaN(semantics, false);
-      fpse.map[&inst] = FPSCEV(nan, nan, false);
-      return;
-    }
-
-    FPSCEV newFpscev(inst.getType());
-
-    newFpscev.min = applyFastMathFlags(newFpscev.min, flags);
-
-    // If min is greater than 1, we definitely return a positive result.
-    if (isInRange(min, getOne(semantics),
-                  APFloat::getLargest(semantics, false))) {
-      newFpscev.min = APFloat::getZero(semantics, false);
-    } else if (!min.isNegative()) {
-      // If the range is entirely positive, then min is not infinity.
-      if (min.isNonZero()) {
-        // If min is greater than zero, the minimum is at least not infinity.
-        newFpscev.min = APFloat::getLargest(semantics, true);
-      } else {
-        newFpscev.min = APFloat::getInf(semantics, true);
-      }
-    }
-
-    // We could do a lot better than this if we had a way to calculate the log
-    // of an APFloat. Our best assumption that we can make at present is that
-    // the maximum result is no larger than the original maximum.
-    newFpscev.max = max;
-
-    fpse.map[&inst] = newFpscev;
-  }
-
-  void visitFma(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const xFPSCEV = fpse.getFPSCEV(inst.getOperand(0));
-    const APFloat xMin = applyFastMathFlags(xFPSCEV->min, flags);
-    const APFloat xMax = applyFastMathFlags(xFPSCEV->max, flags);
-
-    const FPSCEV *const yFPSCEV = fpse.getFPSCEV(inst.getOperand(1));
-    const APFloat yMin = applyFastMathFlags(yFPSCEV->min, flags);
-    const APFloat yMax = applyFastMathFlags(yFPSCEV->max, flags);
-
-    const FPSCEV *const zFPSCEV = fpse.getFPSCEV(inst.getOperand(2));
-    const APFloat zMin = applyFastMathFlags(zFPSCEV->min, flags);
-    const APFloat zMax = applyFastMathFlags(zFPSCEV->max, flags);
-
-    APFloat mins[8] = {xMin, xMin, xMin, xMin, xMax, xMax, xMax, xMax};
-    mins[0].fusedMultiplyAdd(yMin, zMin, APFloat::rmTowardNegative);
-    mins[1].fusedMultiplyAdd(yMin, zMax, APFloat::rmTowardNegative);
-    mins[2].fusedMultiplyAdd(yMax, zMin, APFloat::rmTowardNegative);
-    mins[3].fusedMultiplyAdd(yMax, zMax, APFloat::rmTowardNegative);
-    mins[4].fusedMultiplyAdd(yMin, zMin, APFloat::rmTowardNegative);
-    mins[5].fusedMultiplyAdd(yMin, zMax, APFloat::rmTowardNegative);
-    mins[6].fusedMultiplyAdd(yMax, zMin, APFloat::rmTowardNegative);
-    mins[7].fusedMultiplyAdd(yMax, zMax, APFloat::rmTowardNegative);
-    APFloat min = getMinimum(mins);
-
-    APFloat maxs[8] = {xMin, xMin, xMin, xMin, xMax, xMax, xMax, xMax};
-    maxs[0].fusedMultiplyAdd(yMin, zMin, APFloat::rmTowardPositive);
-    maxs[1].fusedMultiplyAdd(yMin, zMax, APFloat::rmTowardPositive);
-    maxs[2].fusedMultiplyAdd(yMax, zMin, APFloat::rmTowardPositive);
-    maxs[3].fusedMultiplyAdd(yMax, zMax, APFloat::rmTowardPositive);
-    maxs[4].fusedMultiplyAdd(yMin, zMin, APFloat::rmTowardPositive);
-    maxs[5].fusedMultiplyAdd(yMin, zMax, APFloat::rmTowardPositive);
-    maxs[6].fusedMultiplyAdd(yMax, zMin, APFloat::rmTowardPositive);
-    maxs[7].fusedMultiplyAdd(yMax, zMax, APFloat::rmTowardPositive);
-    APFloat max = getMaximum(maxs);
-
-    min = applyFastMathFlags(min, flags);
-    max = applyFastMathFlags(max, flags);
-
-    fpse.map[&inst] = FPSCEV(min, max, false);
-  }
-
-  void visitFabs(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
-
-    APFloat min = applyFastMathFlags(fpscev->min, flags);
-    APFloat max = applyFastMathFlags(fpscev->max, flags);
-
-    // if the range contains positive and negative numbers.
-    const bool positiveAndNegative = min.isNegative() && !max.isNegative();
-
-    // Flip the signs of min and max because we are negating them.
-    min.clearSign();
-    max.clearSign();
-
-    // If we have min = -4 & max = 1, when we clear the sign min = 4 & max = 1,
-    // which is clearly incorrect. Need to recheck which is smaller/larger.
-    APFloat realMin = getMinimum({min, max});
-    APFloat realMax = getMaximum({min, max});
-
-    if (positiveAndNegative) {
-      realMin = APFloat::getZero(realMin.getSemantics());
-    }
-
-    realMin = applyFastMathFlags(realMin, flags);
-    realMax = applyFastMathFlags(realMax, flags);
-
-    fpse.map[&inst] = FPSCEV(realMin, realMax, fpscev->isInteger);
-  }
-
-  void visitMinnum(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const xFpscev = fpse.getFPSCEV(inst.getOperand(0));
-    const FPSCEV *const yFpscev = fpse.getFPSCEV(inst.getOperand(1));
-
-    APFloat xMin = applyFastMathFlags(xFpscev->min, flags);
-    APFloat xMax = applyFastMathFlags(xFpscev->max, flags);
-    APFloat yMin = applyFastMathFlags(yFpscev->min, flags);
-    APFloat yMax = applyFastMathFlags(yFpscev->max, flags);
-
-    const fltSemantics &semantics = xMin.getSemantics();
-
-    APFloat min = APFloat::getNaN(semantics, true);
-
-    if (xMin.isFinite() && yMin.isFinite()) {
-      // If both our mins are finite, choose the smallest.
-      min = getMinimum({xMin, yMin});
-    } else if (xMin.isFinite() ^ yMin.isFinite()) {
-      // If one of our mins is finite, we definitely do not produce a NaN.
-      min = APFloat::getLargest(semantics,
-                                xMin.isNegative() || yMin.isNegative());
-    }
-
-    APFloat max = APFloat::getNaN(semantics, false);
-
-    if (xMax.isFinite() && yMax.isFinite()) {
-      // If both our maxs are finite, choose the smallest.
-      max = getMinimum({xMax, yMax});
-    } else if (xMax.isFinite() ^ yMax.isFinite()) {
-      // If one of our maxs is finite, we definitely do not produce a NaN.
-      max = APFloat::getLargest(semantics,
-                                xMax.isNegative() || yMax.isNegative());
-    }
-
-    min = applyFastMathFlags(min, flags);
-    max = applyFastMathFlags(max, flags);
-
-    fpse.map[&inst] =
-        FPSCEV(min, max, xFpscev->isInteger && yFpscev->isInteger);
-  }
-
-  void visitMaxnum(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const xFpscev = fpse.getFPSCEV(inst.getOperand(0));
-    const FPSCEV *const yFpscev = fpse.getFPSCEV(inst.getOperand(1));
-
-    APFloat xMin = applyFastMathFlags(xFpscev->min, flags);
-    APFloat xMax = applyFastMathFlags(xFpscev->max, flags);
-    APFloat yMin = applyFastMathFlags(yFpscev->min, flags);
-    APFloat yMax = applyFastMathFlags(yFpscev->max, flags);
-
-    const fltSemantics &semantics = xMin.getSemantics();
-
-    APFloat min = APFloat::getNaN(semantics, true);
-
-    if (xMin.isFinite() && yMin.isFinite()) {
-      // If both our mins are finite, choose the largest.
-      min = getMaximum({xMin, yMin});
-    } else if (xMin.isFinite() ^ yMin.isFinite()) {
-      // If one of our mins is finite, we definitely do not produce a NaN.
-      min = APFloat::getLargest(semantics,
-                                xMin.isNegative() || yMin.isNegative());
-    }
-
-    APFloat max = APFloat::getNaN(semantics, false);
-
-    if (xMax.isFinite() && yMax.isFinite()) {
-      // If both our maxs are finite, choose the largest.
-      max = getMaximum({xMax, yMax});
-    } else if (xMax.isFinite() ^ yMax.isFinite()) {
-      // If one of our maxs is finite, we definitely do not produce a NaN.
-      max = APFloat::getLargest(semantics,
-                                xMax.isNegative() || yMax.isNegative());
-    }
-
-    min = applyFastMathFlags(min, flags);
-    max = applyFastMathFlags(max, flags);
-
-    fpse.map[&inst] =
-        FPSCEV(min, max, xFpscev->isInteger && yFpscev->isInteger);
-  }
-
-  void visitMinimum(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const xFpscev = fpse.getFPSCEV(inst.getOperand(0));
-    const FPSCEV *const yFpscev = fpse.getFPSCEV(inst.getOperand(1));
-
-    APFloat xMin = applyFastMathFlags(xFpscev->min, flags);
-    APFloat xMax = applyFastMathFlags(xFpscev->max, flags);
-    APFloat yMin = applyFastMathFlags(yFpscev->min, flags);
-    APFloat yMax = applyFastMathFlags(yFpscev->max, flags);
-
-    const fltSemantics &semantics = xMin.getSemantics();
-
-    APFloat min = APFloat::getNaN(semantics, true);
-
-    if (xMin.isFinite() && yMin.isFinite()) {
-      // If both our mins are finite, choose the smallest.
-      min = getMinimum({xMin, yMin});
-    }
-
-    APFloat max = APFloat::getNaN(semantics, false);
-
-    if (xMax.isFinite() && yMax.isFinite()) {
-      // If both our maxs are finite, choose the smallest.
-      max = getMinimum({xMax, yMax});
-    }
-
-    min = applyFastMathFlags(min, flags);
-    max = applyFastMathFlags(max, flags);
-
-    fpse.map[&inst] =
-        FPSCEV(min, max, xFpscev->isInteger && yFpscev->isInteger);
-  }
-
-  void visitMaximum(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const xFpscev = fpse.getFPSCEV(inst.getOperand(0));
-    const FPSCEV *const yFpscev = fpse.getFPSCEV(inst.getOperand(1));
-
-    APFloat xMin = applyFastMathFlags(xFpscev->min, flags);
-    APFloat xMax = applyFastMathFlags(xFpscev->max, flags);
-    APFloat yMin = applyFastMathFlags(yFpscev->min, flags);
-    APFloat yMax = applyFastMathFlags(yFpscev->max, flags);
-
-    const fltSemantics &semantics = xMin.getSemantics();
-
-    APFloat min = APFloat::getNaN(semantics, true);
-
-    if (xMin.isFinite() && yMin.isFinite()) {
-      // If both our mins are finite, choose the largest.
-      min = getMaximum({xMin, yMin});
-    }
-
-    APFloat max = APFloat::getNaN(semantics, false);
-
-    if (xMax.isFinite() && yMax.isFinite()) {
-      // If both our maxs are finite, choose the largest.
-      max = getMaximum({xMax, yMax});
-    }
-
-    min = applyFastMathFlags(min, flags);
-    max = applyFastMathFlags(max, flags);
-
-    fpse.map[&inst] =
-        FPSCEV(min, max, xFpscev->isInteger && yFpscev->isInteger);
-  }
-
-  void visitCopysign(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const xFpscev = fpse.getFPSCEV(inst.getOperand(0));
-    const FPSCEV *const yFpscev = fpse.getFPSCEV(inst.getOperand(1));
-
-    APFloat xMin = applyFastMathFlags(xFpscev->min, flags);
-    APFloat xMax = applyFastMathFlags(xFpscev->max, flags);
-    APFloat yMin = applyFastMathFlags(yFpscev->min, flags);
-    APFloat yMax = applyFastMathFlags(yFpscev->max, flags);
-
-    const fltSemantics &semantics = xMin.getSemantics();
-
-    APFloat min = xMin;
-    APFloat max = xMax;
-
-    if (yMin.isNegative() && !yMax.isNegative()) {
-      // If the range of y includes negative and positive numbers.
-      APFloat maxs[2] = {min, max};
-      maxs[0].clearSign();
-      maxs[1].clearSign();
-      max = getMaximum(maxs);
-
-      min = max;
-      min.changeSign();
-    } else {
-      // If the range of x contains positive and negative numbers.
-      const bool positiveAndNegative = min.isNegative() && !max.isNegative();
-
-      if (positiveAndNegative) {
-        APFloat mins[2] = {min, max};
-        mins[1].changeSign();
-        min = getMinimum(mins);
-
-        APFloat maxs[2] = {min, max};
-        maxs[0].changeSign();
-        max = getMaximum(maxs);
-      }
-
-      APFloat range[2] = {min, max};
-
-      // Wipe the sign from our range.
-      range[0].clearSign();
-      range[1].clearSign();
-
-      if (yMax.isNegative()) {
-        // If y is all negative, flip the sign of the ranges to negative.
-        range[0].changeSign();
-        range[1].changeSign();
-      }
-
-      min = getMinimum(range);
-      max = getMaximum(range);
-
-      if (positiveAndNegative) {
-        if (yMax.isNegative()) {
-          max = APFloat::getZero(semantics, true);
-        } else {
-          min = APFloat::getZero(semantics, false);
-        }
-      }
-    }
-
-    min = applyFastMathFlags(min, flags);
-    max = applyFastMathFlags(max, flags);
-
-    fpse.map[&inst] = FPSCEV(min, max, xFpscev->isInteger);
-  }
-
-  void visitFloor(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
-
-    APFloat min = applyFastMathFlags(fpscev->min, flags);
-    APFloat max = applyFastMathFlags(fpscev->max, flags);
-
-    min.roundToIntegral(APFloat::rmTowardNegative);
-    max.roundToIntegral(APFloat::rmTowardNegative);
-
-    fpse.map[&inst] = FPSCEV(min, max, true);
-  }
-
-  void visitCeil(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
-
-    APFloat min = applyFastMathFlags(fpscev->min, flags);
-    APFloat max = applyFastMathFlags(fpscev->max, flags);
-
-    min.roundToIntegral(APFloat::rmTowardPositive);
-    max.roundToIntegral(APFloat::rmTowardPositive);
-
-    fpse.map[&inst] = FPSCEV(min, max, true);
-  }
-
-  void visitTruncIntr(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
-
-    APFloat min = applyFastMathFlags(fpscev->min, flags);
-    APFloat max = applyFastMathFlags(fpscev->max, flags);
-
-    min.roundToIntegral(APFloat::rmTowardZero);
-    max.roundToIntegral(APFloat::rmTowardZero);
-
-    fpse.map[&inst] = FPSCEV(min, max, true);
-  }
-
-  void visitRint(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
-
-    APFloat min = applyFastMathFlags(fpscev->min, flags);
-    APFloat max = applyFastMathFlags(fpscev->max, flags);
-
-    min.roundToIntegral(APFloat::rmNearestTiesToEven);
-    max.roundToIntegral(APFloat::rmNearestTiesToEven);
-
-    fpse.map[&inst] = FPSCEV(min, max, true);
-  }
-
-  void visitNearbyInt(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
-
-    APFloat min = applyFastMathFlags(fpscev->min, flags);
-    APFloat max = applyFastMathFlags(fpscev->max, flags);
-
-    min.roundToIntegral(APFloat::rmTowardNegative);
-    max.roundToIntegral(APFloat::rmTowardPositive);
-
-    fpse.map[&inst] = FPSCEV(min, max, true);
-  }
-
-  void visitRound(IntrinsicInst &inst) {
-    const FastMathFlags flags = inst.getFastMathFlags();
-
-    const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
-
-    APFloat min = applyFastMathFlags(fpscev->min, flags);
-    APFloat max = applyFastMathFlags(fpscev->max, flags);
-
-    min.roundToIntegral(APFloat::rmNearestTiesToAway);
-    max.roundToIntegral(APFloat::rmNearestTiesToAway);
-
-    fpse.map[&inst] = FPSCEV(min, max, true);
-  }
-
-  void visitIntrinsicInst(IntrinsicInst &inst) {
-    // Skip any intrinsic that doesn't result in a floating point.
-    if (!inst.getType()->isFloatingPointTy()) {
-      return;
-    }
-
-    switch (inst.getIntrinsicID()) {
-    default:
-      break;
-    case Intrinsic::sqrt:
-      visitSqrt(inst);
-      return;
-    case Intrinsic::powi:
-      visitPowi(inst);
-      return;
-    case Intrinsic::sin:
-      visitTrig(inst);
-      return;
-    case Intrinsic::cos:
-      visitTrig(inst);
-      return;
-    case Intrinsic::exp:
-      visitExp(inst);
-      return;
-    case Intrinsic::exp2:
-      visitExp(inst);
-      return;
-    case Intrinsic::log:
-      visitLog(inst);
-      return;
-    case Intrinsic::log10:
-      visitLog(inst);
-      return;
-    case Intrinsic::log2:
-      visitLog(inst);
-      return;
-    case Intrinsic::fma:
-      visitFma(inst);
-      return;
-    case Intrinsic::fabs:
-      visitFabs(inst);
-      return;
-    case Intrinsic::minnum:
-      visitMinnum(inst);
-      return;
-    case Intrinsic::maxnum:
-      visitMaxnum(inst);
-      return;
-    case Intrinsic::minimum:
-      visitMinimum(inst);
-      return;
-    case Intrinsic::maximum:
-      visitMaximum(inst);
-      return;
-    case Intrinsic::copysign:
-      visitCopysign(inst);
-      return;
-    case Intrinsic::floor:
-      visitFloor(inst);
-      return;
-    case Intrinsic::ceil:
-      visitCeil(inst);
-      return;
-    case Intrinsic::trunc:
-      visitTruncIntr(inst);
-      return;
-    case Intrinsic::rint:
-      visitRint(inst);
-      return;
-    case Intrinsic::nearbyint:
-      visitNearbyInt(inst);
-      return;
-    case Intrinsic::round:
-      visitRound(inst);
-      return;
-    }
-
-    FPSCEV fpscev(inst.getType());
-
-    const FastMathFlags flags = inst.getFastMathFlags();
-    fpscev.min = applyFastMathFlags(fpscev.min, flags);
-    fpscev.max = applyFastMathFlags(fpscev.max, flags);
-
-    fpse.map[&inst] = fpscev;
-  }
+  void visitIntrinsicInst(IntrinsicInst &inst);
 
   // Get analysis usage allows us to tell LLVM which passes we require.
   void getAnalysisUsage(AnalysisUsage &AU) const override {
@@ -1455,6 +839,814 @@ private:
   FPScalarEvolution fpse;
   ScalarEvolution *scalarEvolution;
 };
+
+FPSCEV sqrtBounds(FPSCEV fpscev) {
+  const fltSemantics &semantics = fpscev.getSemantics();
+
+  // If the full range is negative, always returns a NaN.
+  if (fpscev.isAllNegative()) {
+    APFloat nan = APFloat::getNaN(semantics, false);
+    return FPSCEV(nan, nan, false);
+  }
+
+  bool losesInfo;
+
+  if (fpscev.isAllNonNegative()) {
+    fpscev.min.convert(APFloat::IEEEdouble(), APFloat::rmTowardNegative,
+                       &losesInfo);
+
+    // Get the next number less than the current (unless we are zero).
+    if (!fpscev.min.isZero()) {
+      fpscev.min.next(true);
+    }
+    fpscev.min = APFloat(std::sqrt(fpscev.min.convertToDouble()));
+    fpscev.min.convert(semantics, APFloat::rmTowardNegative, &losesInfo);
+  }
+
+  // If the whole fpscev is not negative, it means max must be positive.
+  if (!fpscev.isAllNegative()) {
+    fpscev.max.convert(APFloat::IEEEdouble(), APFloat::rmTowardPositive,
+                       &losesInfo);
+    fpscev.max.next(false);
+    fpscev.max = APFloat(std::sqrt(fpscev.max.convertToDouble()));
+    fpscev.max.convert(semantics, APFloat::rmTowardPositive, &losesInfo);
+  }
+
+  fpscev.isInteger = false;
+
+  return fpscev;
+}
+
+// For exp2, we convert the fpscev that we are using as a power to integer, and
+// then use scalbn to get a lower/upper bound for it (rounding the min value
+// down, and the max value up).
+FPSCEV exp2Bounds(FPSCEV fpscev) {
+  const fltSemantics &semantics = fpscev.getSemantics();
+  const APFloat one = getOne(semantics);
+
+  bool losesInfo;
+
+  if (fpscev.min.isFinite()) {
+    fpscev.min.roundToIntegral(APFloat::rmTowardNegative);
+    fpscev.min.convert(APFloat::IEEEdouble(), APFloat::rmTowardNegative,
+                       &losesInfo);
+
+    const int power = static_cast<int>(fpscev.min.convertToDouble());
+
+    fpscev.min = scalbn(one, power, APFloat::rmTowardNegative);
+  } else {
+    fpscev.min = APFloat::getInf(semantics, true);
+  }
+
+  if (fpscev.max.isFinite()) {
+    fpscev.max.roundToIntegral(APFloat::rmTowardPositive);
+    fpscev.max.convert(APFloat::IEEEdouble(), APFloat::rmTowardPositive,
+                       &losesInfo);
+
+    const int power = static_cast<int>(fpscev.max.convertToDouble());
+
+    fpscev.max = scalbn(one, power, APFloat::rmTowardPositive);
+  } else {
+    fpscev.max = APFloat::getInf(semantics, false);
+  }
+
+  return fpscev;
+}
+
+FPSCEV log2Bounds(FPSCEV fpscev) {
+  const fltSemantics &semantics = fpscev.getSemantics();
+
+  // If the full range is negative, always returns a NaN.
+  if (fpscev.isAllNegative()) {
+    APFloat nan = APFloat::getNaN(semantics, false);
+    return FPSCEV(nan, nan, false);
+  }
+
+  const APInt ilogbMin(32, ilogb(fpscev.min));
+  // We do +1 here so we round the range up.
+  const APInt ilogbMax(32, ilogb(fpscev.max) + 1);
+
+  APFloat values[2] = {getFromInt(semantics, ilogbMin, true),
+                       getFromInt(semantics, ilogbMax, true)};
+
+  // If the input is entirely greater than zero, we can use ilogb to get a much
+  // firmer estimate on the log result.
+  if (fpscev.isGreaterThan(APFloat::getZero(semantics))) {
+    fpscev.min = getMinimum(values);
+    fpscev.max = getMaximum(values);
+  } else {
+    fpscev.min = APFloat::getInf(semantics, true);
+    fpscev.max = values[1];
+  }
+
+  // Can't be sure about this because we're getting very vague bounds, so wipe
+  // it.
+  fpscev.isInteger = false;
+
+  return fpscev;
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::sqrt>(
+    IntrinsicInst &inst) {
+  const FastMathFlags fmf = inst.getFastMathFlags();
+
+  FPSCEV fpscev =
+      fpse.getFPSCEV(inst.getOperand(0))->cloneWithFastMathFlags(fmf);
+
+  fpscev = sqrtBounds(fpscev);
+
+  fpse.map[&inst] = fpscev.cloneWithFastMathFlags(fmf);
+}
+
+// For pow we use exp2(y * log2(x)) to get the best bounds we can hope for.
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::pow>(
+    IntrinsicInst &inst) {
+  const FastMathFlags fmf = inst.getFastMathFlags();
+
+  const FPSCEV xFpscev =
+      fpse.getFPSCEV(inst.getOperand(0))->cloneWithFastMathFlags(fmf);
+  const FPSCEV yFpscev =
+      fpse.getFPSCEV(inst.getOperand(1))->cloneWithFastMathFlags(fmf);
+
+  FPSCEV log2Fpscev = log2Bounds(xFpscev);
+  FPSCEV fpscevs[4] = {log2Fpscev, log2Fpscev, log2Fpscev, log2Fpscev};
+
+  fpscevs[0].min.multiply(yFpscev.min, APFloat::rmTowardNegative);
+  fpscevs[0].max.multiply(yFpscev.min, APFloat::rmTowardNegative);
+
+  fpscevs[1].min.multiply(yFpscev.max, APFloat::rmTowardNegative);
+  fpscevs[1].max.multiply(yFpscev.max, APFloat::rmTowardNegative);
+
+  fpscevs[2].min.multiply(yFpscev.min, APFloat::rmTowardPositive);
+  fpscevs[2].max.multiply(yFpscev.min, APFloat::rmTowardPositive);
+
+  fpscevs[3].min.multiply(yFpscev.max, APFloat::rmTowardPositive);
+  fpscevs[3].max.multiply(yFpscev.max, APFloat::rmTowardPositive);
+
+  fpscevs[0] = exp2Bounds(fpscevs[0]);
+  fpscevs[1] = exp2Bounds(fpscevs[1]);
+  fpscevs[2] = exp2Bounds(fpscevs[2]);
+  fpscevs[3] = exp2Bounds(fpscevs[3]);
+
+  FPSCEV result;
+
+  result.min = getMinimum({fpscevs[0].min, fpscevs[0].max, fpscevs[1].min,
+                           fpscevs[1].max, fpscevs[2].min, fpscevs[2].max,
+                           fpscevs[3].min, fpscevs[3].max});
+  result.max = getMaximum({fpscevs[0].min, fpscevs[0].max, fpscevs[1].min,
+                           fpscevs[1].max, fpscevs[2].min, fpscevs[2].max,
+                           fpscevs[3].min, fpscevs[3].max});
+  result.isInteger = false;
+
+  fpse.map[&inst] = result.cloneWithFastMathFlags(fmf);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::powi>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
+  ConstantRange range = scalarEvolution->getSignedRange(
+      scalarEvolution->getSCEV(inst.getOperand(1)));
+
+  APFloat min = applyFastMathFlags(fpscev->min, flags);
+  APFloat max = applyFastMathFlags(fpscev->max, flags);
+
+  const fltSemantics &semantics = min.getSemantics();
+
+  const APFloat zero = APFloat::getZero(semantics, false);
+  const APFloat one = getOne(semantics);
+
+  // If the value to raise to a power is positive.
+  if (!min.isNegative()) {
+    const bool isOneOrLess =
+        isInRange(min, zero, one) && isInRange(max, zero, one);
+
+    // If the integer power is a negative and the float is greater than one,
+    // the result will always be at least as small as the inputs.
+    if (isAllNegative(range) && !isOneOrLess) {
+      fpse.map[&inst] = FPSCEV(zero, max, false);
+      return;
+    }
+
+    // If the integer power is definitely not a negative, the result will be
+    // in the range [min(1, min)..infinity] if x is greater than 1. Otherwise
+    // the output will be between 0 and 1.
+    if (isAllNonNegative(range)) {
+      // Because x^0 == 1, the output could always be 1 or lower.
+      min = isOneOrLess ? zero : getMinimum({min, one});
+
+      // If the input x is one or greater then the output could be as
+      max = isOneOrLess ? one : APFloat::getInf(semantics, false);
+
+      max = applyFastMathFlags(max, flags);
+
+      fpse.map[&inst] = FPSCEV(min, max, false);
+      return;
+    }
+  }
+
+  FPSCEV newFpscev(inst.getType());
+
+  newFpscev.min = applyFastMathFlags(newFpscev.min, flags);
+  newFpscev.max = applyFastMathFlags(newFpscev.max, flags);
+
+  fpse.map[&inst] = newFpscev;
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::cos>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
+  APFloat min = applyFastMathFlags(fpscev->min, flags);
+  APFloat max = applyFastMathFlags(fpscev->max, flags);
+
+  // If the range is finite (not inf or nan) the output is always [-1..1].
+  if (min.isFinite() && max.isFinite()) {
+    const APFloat one = getOne(min.getSemantics());
+    APFloat minusOne = one;
+    minusOne.changeSign();
+
+    fpse.map[&inst] = FPSCEV(minusOne, one, false);
+    return;
+  }
+
+  FPSCEV newFpscev(inst.getType());
+
+  newFpscev.min = applyFastMathFlags(newFpscev.min, flags);
+  newFpscev.max = applyFastMathFlags(newFpscev.max, flags);
+
+  fpse.map[&inst] = newFpscev;
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::sin>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
+  APFloat min = applyFastMathFlags(fpscev->min, flags);
+  APFloat max = applyFastMathFlags(fpscev->max, flags);
+
+  // If the range is finite (not inf or nan) the output is always [-1..1].
+  if (min.isFinite() && max.isFinite()) {
+    const APFloat one = getOne(min.getSemantics());
+    APFloat minusOne = one;
+    minusOne.changeSign();
+
+    fpse.map[&inst] = FPSCEV(minusOne, one, false);
+    return;
+  }
+
+  FPSCEV newFpscev(inst.getType());
+
+  newFpscev.min = applyFastMathFlags(newFpscev.min, flags);
+  newFpscev.max = applyFastMathFlags(newFpscev.max, flags);
+
+  fpse.map[&inst] = newFpscev;
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::exp>(
+    IntrinsicInst &inst) {
+  FPSCEV fpscev(inst.getType());
+
+  // Exp always has a positive result.
+  const APFloat zero = APFloat::getZero(fpscev.min.getSemantics(), false);
+  fpscev.min = zero;
+
+  const FastMathFlags flags = inst.getFastMathFlags();
+  fpscev.max = applyFastMathFlags(fpscev.max, flags);
+
+  fpse.map[&inst] = fpscev;
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::exp2>(
+    IntrinsicInst &inst) {
+  const FastMathFlags fmf = inst.getFastMathFlags();
+
+  FPSCEV fpscev =
+      fpse.getFPSCEV(inst.getOperand(0))->cloneWithFastMathFlags(fmf);
+
+  fpscev = exp2Bounds(fpscev);
+
+  fpse.map[&inst] = fpscev.cloneWithFastMathFlags(fmf);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::log>(
+    IntrinsicInst &inst) {
+  const FastMathFlags fmf = inst.getFastMathFlags();
+
+  FPSCEV fpscev =
+      fpse.getFPSCEV(inst.getOperand(0))->cloneWithFastMathFlags(fmf);
+
+  fpscev = log2Bounds(fpscev);
+
+  // We are calculating log(x), but we only have ilogb (which gives us an
+  // effective lower bound of log2(x)). To convert this bound into log(x) by
+  // multiplying it by log(2).
+  APFloat converter(
+      0.693147180559945309417232121458176568075500134360255254120);
+  bool losesInfo;
+  converter.convert(fpscev.getSemantics(), APFloat::rmNearestTiesToEven,
+                    &losesInfo);
+
+  fpscev.min.multiply(converter, APFloat::rmTowardNegative);
+  fpscev.max.multiply(converter, APFloat::rmTowardPositive);
+
+  fpse.map[&inst] = fpscev.cloneWithFastMathFlags(fmf);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::log10>(
+    IntrinsicInst &inst) {
+  const FastMathFlags fmf = inst.getFastMathFlags();
+
+  FPSCEV fpscev =
+      fpse.getFPSCEV(inst.getOperand(0))->cloneWithFastMathFlags(fmf);
+
+  fpscev = log2Bounds(fpscev);
+
+  // We are calculating log10(x), but we only have ilogb (which gives us an
+  // effective lower bound of log2(x)). To convert this bound into log10(x) by
+  // multiplying it by 1/log2(10).
+  APFloat converter(
+      0.301029995663981195213738894724493026768189881462108541310);
+  bool losesInfo;
+  converter.convert(fpscev.getSemantics(), APFloat::rmNearestTiesToEven,
+                    &losesInfo);
+
+  fpscev.min.multiply(converter, APFloat::rmTowardNegative);
+  fpscev.max.multiply(converter, APFloat::rmTowardPositive);
+
+  fpse.map[&inst] = fpscev.cloneWithFastMathFlags(fmf);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::log2>(
+    IntrinsicInst &inst) {
+  const FastMathFlags fmf = inst.getFastMathFlags();
+
+  const FPSCEV fpscev =
+      fpse.getFPSCEV(inst.getOperand(0))->cloneWithFastMathFlags(fmf);
+
+  fpse.map[&inst] = log2Bounds(fpscev).cloneWithFastMathFlags(fmf);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::fma>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const xFPSCEV = fpse.getFPSCEV(inst.getOperand(0));
+  const APFloat xMin = applyFastMathFlags(xFPSCEV->min, flags);
+  const APFloat xMax = applyFastMathFlags(xFPSCEV->max, flags);
+
+  const FPSCEV *const yFPSCEV = fpse.getFPSCEV(inst.getOperand(1));
+  const APFloat yMin = applyFastMathFlags(yFPSCEV->min, flags);
+  const APFloat yMax = applyFastMathFlags(yFPSCEV->max, flags);
+
+  const FPSCEV *const zFPSCEV = fpse.getFPSCEV(inst.getOperand(2));
+  const APFloat zMin = applyFastMathFlags(zFPSCEV->min, flags);
+  const APFloat zMax = applyFastMathFlags(zFPSCEV->max, flags);
+
+  APFloat mins[8] = {xMin, xMin, xMin, xMin, xMax, xMax, xMax, xMax};
+  mins[0].fusedMultiplyAdd(yMin, zMin, APFloat::rmTowardNegative);
+  mins[1].fusedMultiplyAdd(yMin, zMax, APFloat::rmTowardNegative);
+  mins[2].fusedMultiplyAdd(yMax, zMin, APFloat::rmTowardNegative);
+  mins[3].fusedMultiplyAdd(yMax, zMax, APFloat::rmTowardNegative);
+  mins[4].fusedMultiplyAdd(yMin, zMin, APFloat::rmTowardNegative);
+  mins[5].fusedMultiplyAdd(yMin, zMax, APFloat::rmTowardNegative);
+  mins[6].fusedMultiplyAdd(yMax, zMin, APFloat::rmTowardNegative);
+  mins[7].fusedMultiplyAdd(yMax, zMax, APFloat::rmTowardNegative);
+  APFloat min = getMinimum(mins);
+
+  APFloat maxs[8] = {xMin, xMin, xMin, xMin, xMax, xMax, xMax, xMax};
+  maxs[0].fusedMultiplyAdd(yMin, zMin, APFloat::rmTowardPositive);
+  maxs[1].fusedMultiplyAdd(yMin, zMax, APFloat::rmTowardPositive);
+  maxs[2].fusedMultiplyAdd(yMax, zMin, APFloat::rmTowardPositive);
+  maxs[3].fusedMultiplyAdd(yMax, zMax, APFloat::rmTowardPositive);
+  maxs[4].fusedMultiplyAdd(yMin, zMin, APFloat::rmTowardPositive);
+  maxs[5].fusedMultiplyAdd(yMin, zMax, APFloat::rmTowardPositive);
+  maxs[6].fusedMultiplyAdd(yMax, zMin, APFloat::rmTowardPositive);
+  maxs[7].fusedMultiplyAdd(yMax, zMax, APFloat::rmTowardPositive);
+  APFloat max = getMaximum(maxs);
+
+  min = applyFastMathFlags(min, flags);
+  max = applyFastMathFlags(max, flags);
+
+  fpse.map[&inst] = FPSCEV(min, max, false);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::fabs>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
+
+  APFloat min = applyFastMathFlags(fpscev->min, flags);
+  APFloat max = applyFastMathFlags(fpscev->max, flags);
+
+  // if the range contains positive and negative numbers.
+  const bool positiveAndNegative = min.isNegative() && !max.isNegative();
+
+  // Flip the signs of min and max because we are negating them.
+  min.clearSign();
+  max.clearSign();
+
+  // If we have min = -4 & max = 1, when we clear the sign min = 4 & max = 1,
+  // which is clearly incorrect. Need to recheck which is smaller/larger.
+  APFloat realMin = getMinimum({min, max});
+  APFloat realMax = getMaximum({min, max});
+
+  if (positiveAndNegative) {
+    realMin = APFloat::getZero(realMin.getSemantics());
+  }
+
+  realMin = applyFastMathFlags(realMin, flags);
+  realMax = applyFastMathFlags(realMax, flags);
+
+  fpse.map[&inst] = FPSCEV(realMin, realMax, fpscev->isInteger);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::minnum>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const xFpscev = fpse.getFPSCEV(inst.getOperand(0));
+  const FPSCEV *const yFpscev = fpse.getFPSCEV(inst.getOperand(1));
+
+  APFloat xMin = applyFastMathFlags(xFpscev->min, flags);
+  APFloat xMax = applyFastMathFlags(xFpscev->max, flags);
+  APFloat yMin = applyFastMathFlags(yFpscev->min, flags);
+  APFloat yMax = applyFastMathFlags(yFpscev->max, flags);
+
+  const fltSemantics &semantics = xMin.getSemantics();
+
+  APFloat min = APFloat::getNaN(semantics, true);
+
+  if (xMin.isFinite() && yMin.isFinite()) {
+    // If both our mins are finite, choose the smallest.
+    min = getMinimum({xMin, yMin});
+  } else if (xMin.isFinite() ^ yMin.isFinite()) {
+    // If one of our mins is finite, we definitely do not produce a NaN.
+    min =
+        APFloat::getLargest(semantics, xMin.isNegative() || yMin.isNegative());
+  }
+
+  APFloat max = APFloat::getNaN(semantics, false);
+
+  if (xMax.isFinite() && yMax.isFinite()) {
+    // If both our maxs are finite, choose the smallest.
+    max = getMinimum({xMax, yMax});
+  } else if (xMax.isFinite() ^ yMax.isFinite()) {
+    // If one of our maxs is finite, we definitely do not produce a NaN.
+    max =
+        APFloat::getLargest(semantics, xMax.isNegative() || yMax.isNegative());
+  }
+
+  min = applyFastMathFlags(min, flags);
+  max = applyFastMathFlags(max, flags);
+
+  fpse.map[&inst] = FPSCEV(min, max, xFpscev->isInteger && yFpscev->isInteger);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::maxnum>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const xFpscev = fpse.getFPSCEV(inst.getOperand(0));
+  const FPSCEV *const yFpscev = fpse.getFPSCEV(inst.getOperand(1));
+
+  APFloat xMin = applyFastMathFlags(xFpscev->min, flags);
+  APFloat xMax = applyFastMathFlags(xFpscev->max, flags);
+  APFloat yMin = applyFastMathFlags(yFpscev->min, flags);
+  APFloat yMax = applyFastMathFlags(yFpscev->max, flags);
+
+  const fltSemantics &semantics = xMin.getSemantics();
+
+  APFloat min = APFloat::getNaN(semantics, true);
+
+  if (xMin.isFinite() && yMin.isFinite()) {
+    // If both our mins are finite, choose the largest.
+    min = getMaximum({xMin, yMin});
+  } else if (xMin.isFinite() ^ yMin.isFinite()) {
+    // If one of our mins is finite, we definitely do not produce a NaN.
+    min =
+        APFloat::getLargest(semantics, xMin.isNegative() || yMin.isNegative());
+  }
+
+  APFloat max = APFloat::getNaN(semantics, false);
+
+  if (xMax.isFinite() && yMax.isFinite()) {
+    // If both our maxs are finite, choose the largest.
+    max = getMaximum({xMax, yMax});
+  } else if (xMax.isFinite() ^ yMax.isFinite()) {
+    // If one of our maxs is finite, we definitely do not produce a NaN.
+    max =
+        APFloat::getLargest(semantics, xMax.isNegative() || yMax.isNegative());
+  }
+
+  min = applyFastMathFlags(min, flags);
+  max = applyFastMathFlags(max, flags);
+
+  fpse.map[&inst] = FPSCEV(min, max, xFpscev->isInteger && yFpscev->isInteger);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::minimum>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const xFpscev = fpse.getFPSCEV(inst.getOperand(0));
+  const FPSCEV *const yFpscev = fpse.getFPSCEV(inst.getOperand(1));
+
+  APFloat xMin = applyFastMathFlags(xFpscev->min, flags);
+  APFloat xMax = applyFastMathFlags(xFpscev->max, flags);
+  APFloat yMin = applyFastMathFlags(yFpscev->min, flags);
+  APFloat yMax = applyFastMathFlags(yFpscev->max, flags);
+
+  const fltSemantics &semantics = xMin.getSemantics();
+
+  APFloat min = APFloat::getNaN(semantics, true);
+
+  if (xMin.isFinite() && yMin.isFinite()) {
+    // If both our mins are finite, choose the smallest.
+    min = getMinimum({xMin, yMin});
+  }
+
+  APFloat max = APFloat::getNaN(semantics, false);
+
+  if (xMax.isFinite() && yMax.isFinite()) {
+    // If both our maxs are finite, choose the smallest.
+    max = getMinimum({xMax, yMax});
+  }
+
+  min = applyFastMathFlags(min, flags);
+  max = applyFastMathFlags(max, flags);
+
+  fpse.map[&inst] = FPSCEV(min, max, xFpscev->isInteger && yFpscev->isInteger);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::maximum>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const xFpscev = fpse.getFPSCEV(inst.getOperand(0));
+  const FPSCEV *const yFpscev = fpse.getFPSCEV(inst.getOperand(1));
+
+  APFloat xMin = applyFastMathFlags(xFpscev->min, flags);
+  APFloat xMax = applyFastMathFlags(xFpscev->max, flags);
+  APFloat yMin = applyFastMathFlags(yFpscev->min, flags);
+  APFloat yMax = applyFastMathFlags(yFpscev->max, flags);
+
+  const fltSemantics &semantics = xMin.getSemantics();
+
+  APFloat min = APFloat::getNaN(semantics, true);
+
+  if (xMin.isFinite() && yMin.isFinite()) {
+    // If both our mins are finite, choose the largest.
+    min = getMaximum({xMin, yMin});
+  }
+
+  APFloat max = APFloat::getNaN(semantics, false);
+
+  if (xMax.isFinite() && yMax.isFinite()) {
+    // If both our maxs are finite, choose the largest.
+    max = getMaximum({xMax, yMax});
+  }
+
+  min = applyFastMathFlags(min, flags);
+  max = applyFastMathFlags(max, flags);
+
+  fpse.map[&inst] = FPSCEV(min, max, xFpscev->isInteger && yFpscev->isInteger);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::copysign>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const xFpscev = fpse.getFPSCEV(inst.getOperand(0));
+  const FPSCEV *const yFpscev = fpse.getFPSCEV(inst.getOperand(1));
+
+  APFloat xMin = applyFastMathFlags(xFpscev->min, flags);
+  APFloat xMax = applyFastMathFlags(xFpscev->max, flags);
+  APFloat yMin = applyFastMathFlags(yFpscev->min, flags);
+  APFloat yMax = applyFastMathFlags(yFpscev->max, flags);
+
+  const fltSemantics &semantics = xMin.getSemantics();
+
+  APFloat min = xMin;
+  APFloat max = xMax;
+
+  if (yMin.isNegative() && !yMax.isNegative()) {
+    // If the range of y includes negative and positive numbers.
+    APFloat maxs[2] = {min, max};
+    maxs[0].clearSign();
+    maxs[1].clearSign();
+    max = getMaximum(maxs);
+
+    min = max;
+    min.changeSign();
+  } else {
+    // If the range of x contains positive and negative numbers.
+    const bool positiveAndNegative = min.isNegative() && !max.isNegative();
+
+    if (positiveAndNegative) {
+      APFloat mins[2] = {min, max};
+      mins[1].changeSign();
+      min = getMinimum(mins);
+
+      APFloat maxs[2] = {min, max};
+      maxs[0].changeSign();
+      max = getMaximum(maxs);
+    }
+
+    APFloat range[2] = {min, max};
+
+    // Wipe the sign from our range.
+    range[0].clearSign();
+    range[1].clearSign();
+
+    if (yMax.isNegative()) {
+      // If y is all negative, flip the sign of the ranges to negative.
+      range[0].changeSign();
+      range[1].changeSign();
+    }
+
+    min = getMinimum(range);
+    max = getMaximum(range);
+
+    if (positiveAndNegative) {
+      if (yMax.isNegative()) {
+        max = APFloat::getZero(semantics, true);
+      } else {
+        min = APFloat::getZero(semantics, false);
+      }
+    }
+  }
+
+  min = applyFastMathFlags(min, flags);
+  max = applyFastMathFlags(max, flags);
+
+  fpse.map[&inst] = FPSCEV(min, max, xFpscev->isInteger);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::floor>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
+
+  APFloat min = applyFastMathFlags(fpscev->min, flags);
+  APFloat max = applyFastMathFlags(fpscev->max, flags);
+
+  min.roundToIntegral(APFloat::rmTowardNegative);
+  max.roundToIntegral(APFloat::rmTowardNegative);
+
+  fpse.map[&inst] = FPSCEV(min, max, true);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::ceil>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
+
+  APFloat min = applyFastMathFlags(fpscev->min, flags);
+  APFloat max = applyFastMathFlags(fpscev->max, flags);
+
+  min.roundToIntegral(APFloat::rmTowardPositive);
+  max.roundToIntegral(APFloat::rmTowardPositive);
+
+  fpse.map[&inst] = FPSCEV(min, max, true);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::trunc>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
+
+  APFloat min = applyFastMathFlags(fpscev->min, flags);
+  APFloat max = applyFastMathFlags(fpscev->max, flags);
+
+  min.roundToIntegral(APFloat::rmTowardZero);
+  max.roundToIntegral(APFloat::rmTowardZero);
+
+  fpse.map[&inst] = FPSCEV(min, max, true);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::rint>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
+
+  APFloat min = applyFastMathFlags(fpscev->min, flags);
+  APFloat max = applyFastMathFlags(fpscev->max, flags);
+
+  min.roundToIntegral(APFloat::rmNearestTiesToEven);
+  max.roundToIntegral(APFloat::rmNearestTiesToEven);
+
+  fpse.map[&inst] = FPSCEV(min, max, true);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::nearbyint>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
+
+  APFloat min = applyFastMathFlags(fpscev->min, flags);
+  APFloat max = applyFastMathFlags(fpscev->max, flags);
+
+  min.roundToIntegral(APFloat::rmTowardNegative);
+  max.roundToIntegral(APFloat::rmTowardPositive);
+
+  fpse.map[&inst] = FPSCEV(min, max, true);
+}
+
+template <>
+void FPScalarEvolutionPass::visitIntrinsic<Intrinsic::round>(
+    IntrinsicInst &inst) {
+  const FastMathFlags flags = inst.getFastMathFlags();
+
+  const FPSCEV *const fpscev = fpse.getFPSCEV(inst.getOperand(0));
+
+  APFloat min = applyFastMathFlags(fpscev->min, flags);
+  APFloat max = applyFastMathFlags(fpscev->max, flags);
+
+  min.roundToIntegral(APFloat::rmNearestTiesToAway);
+  max.roundToIntegral(APFloat::rmNearestTiesToAway);
+
+  fpse.map[&inst] = FPSCEV(min, max, true);
+}
+
+void FPScalarEvolutionPass::visitIntrinsicInst(IntrinsicInst &inst) {
+  // Skip any intrinsic that doesn't result in a floating point.
+  if (!inst.getType()->isFloatingPointTy()) {
+    return;
+  }
+
+  switch (inst.getIntrinsicID()) {
+  default:
+    break;
+#define INTRINSIC_VISIT(x)                                                     \
+  case x:                                                                      \
+    return visitIntrinsic<x>(inst)
+    INTRINSIC_VISIT(Intrinsic::sqrt);
+    INTRINSIC_VISIT(Intrinsic::pow);
+    INTRINSIC_VISIT(Intrinsic::powi);
+    INTRINSIC_VISIT(Intrinsic::sin);
+    INTRINSIC_VISIT(Intrinsic::cos);
+    INTRINSIC_VISIT(Intrinsic::exp);
+    INTRINSIC_VISIT(Intrinsic::exp2);
+    INTRINSIC_VISIT(Intrinsic::log);
+    INTRINSIC_VISIT(Intrinsic::log10);
+    INTRINSIC_VISIT(Intrinsic::log2);
+    INTRINSIC_VISIT(Intrinsic::fma);
+    INTRINSIC_VISIT(Intrinsic::fabs);
+    INTRINSIC_VISIT(Intrinsic::minnum);
+    INTRINSIC_VISIT(Intrinsic::maxnum);
+    INTRINSIC_VISIT(Intrinsic::minimum);
+    INTRINSIC_VISIT(Intrinsic::maximum);
+    INTRINSIC_VISIT(Intrinsic::copysign);
+    INTRINSIC_VISIT(Intrinsic::floor);
+    INTRINSIC_VISIT(Intrinsic::ceil);
+    INTRINSIC_VISIT(Intrinsic::trunc);
+    INTRINSIC_VISIT(Intrinsic::rint);
+    INTRINSIC_VISIT(Intrinsic::nearbyint);
+    INTRINSIC_VISIT(Intrinsic::round);
+#undef INTRINSIC_VISIT
+  }
+
+  FPSCEV fpscev(inst.getType());
+
+  const FastMathFlags flags = inst.getFastMathFlags();
+  fpscev.min = applyFastMathFlags(fpscev.min, flags);
+  fpscev.max = applyFastMathFlags(fpscev.max, flags);
+
+  fpse.map[&inst] = fpscev;
+}
+
 } // namespace
 
 char FPScalarEvolutionPass::ID;
